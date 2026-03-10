@@ -1,0 +1,12 @@
+build*/
+.cache/
+.claude/
+__pycache__/
+benchmarks/__pycache__/
+benchmarks/.pathwyse/
+benchmarks/results/
+.venv/
+.pytest_cache/
+*.egg-info/
+dist/
+.DS_Store
