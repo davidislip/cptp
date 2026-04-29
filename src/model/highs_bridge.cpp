@@ -16,6 +16,7 @@
 #include "parallel/parallel.h"
 #include "preprocess/edge_elimination.h"
 #include "preprocess/reachability.h"
+#include "sep/cut_selector.h"
 #include "sep/sec_separator.h"
 #include "sep/separation_context.h"
 #include "sep/separation_oracle.h"
@@ -426,6 +427,22 @@ void HiGHSBridge::install_separators() {
                        [](const PooledCut& a, const PooledCut& b) {
                          return a.violation > b.violation;
                        });
+
+      // Karamanov §3 DA-dyn(k): optional angle-based filtering.
+      if (cut_selector_fraction_ < 1.0 - 1e-12 && pool.size() > 1) {
+        std::vector<sep::Cut> pool_cuts;
+        pool_cuts.reserve(pool.size());
+        for (const auto& pc : pool) {
+          pool_cuts.push_back(results[pc.sep_idx][pc.cut_idx]);
+        }
+        auto picked = sep::CutSelector::select_da_dyn_indices(
+            pool_cuts, cut_selector_fraction_);
+        std::vector<PooledCut> filtered;
+        filtered.reserve(picked.size());
+        for (int32_t i : picked) filtered.push_back(pool[i]);
+        pool = std::move(filtered);
+      }
+
       int32_t round_added = 0;
       for (const auto& pc : pool) {
         if (max_cuts_per_round_ > 0 && round_added >= max_cuts_per_round_)

@@ -74,6 +74,14 @@ class SeparationOracle {
   }
   int32_t max_cuts_per_separator() const { return max_cuts_per_sep_; }
 
+  /// Set the cut-selection fraction (Karamanov 2006 §3, DA-dyn(k)).
+  /// 1.0 = keep all (Add-all, default). Smaller values filter cuts by
+  /// depth + pairwise angle, retaining roughly fraction*total cuts.
+  void set_cut_selector_fraction(double fraction) {
+    cut_selector_fraction_ = fraction;
+  }
+  double cut_selector_fraction() const { return cut_selector_fraction_; }
+
   /// Access the registered separators (e.g., for statistics).
   const std::vector<std::unique_ptr<Separator>>& separators() const {
     return separators_;
@@ -83,6 +91,7 @@ class SeparationOracle {
   const Problem& prob_;
   std::vector<std::unique_ptr<Separator>> separators_;
   int32_t max_cuts_per_sep_ = 3;
+  double cut_selector_fraction_ = 1.0;
 };
 
 }  // namespace cptp::sep

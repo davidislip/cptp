@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 
 #include "model/highs_bridge.h"
 #include "parallel/parallel.h"
@@ -64,15 +65,154 @@ std::string join_tokens(const std::vector<std::string>& tokens,
 
 constexpr int32_t kWarmStartLsStartsPerThread = 4;
 
+// Generate MIG (Mixed Integer Gomory) disjunction candidates from the current
+// LP simplex tableau. For each fractional basic variable, derives the optimal
+// MIG disjunction (Karamanov 2006, §2.3, eq. 2.6) and ranks by intersection-
+// cut depth (eq. 2.3–2.5). Returns the top max_k candidates, deepest first.
+static std::vector<HighsUserSeparator::HyperplaneCandidate>
+generate_mig_disjunctions(const HighsMipSolver& mipsolver, int max_k) {
+  if (max_k <= 0) return {};
+
+  auto& lp = mipsolver.mipdata_->lp;
+  auto& lpsolver = lp.getLpSolver();
+
+  if (lpsolver.getModelStatus() != HighsModelStatus::kOptimal) return {};
+
+  const int num_cols = lpsolver.getNumCol();
+  const int num_rows = lpsolver.getNumRow();
+  if (num_cols <= 0 || num_rows <= 0) return {};
+
+  const auto& frac_vars = lp.getFractionalIntegers();  // vector<pair<col,val>>
+  if (frac_vars.empty()) return {};
+
+  // basic_vars[row] = LP column index of basic variable in that row (>= 0),
+  // or -(slack_row+1) for a basic slack.
+  std::vector<HighsInt> basic_vars(num_rows);
+  if (lpsolver.getBasicVariables(basic_vars.data()) != HighsStatus::kOk)
+    return {};
+
+  std::unordered_map<HighsInt, HighsInt> col_to_brow;
+  col_to_brow.reserve(frac_vars.size() * 2);
+  for (HighsInt i = 0; i < num_rows; ++i) {
+    if (basic_vars[i] >= 0) col_to_brow.emplace(basic_vars[i], i);
+  }
+
+  const HighsBasis& basis = lpsolver.getBasis();
+  if (!basis.valid) return {};
+
+  struct MIGEntry {
+    HighsUserSeparator::HyperplaneCandidate cand;
+    double depth;
+  };
+  std::vector<MIGEntry> entries;
+  entries.reserve(frac_vars.size());
+
+  std::vector<double> row_vec(num_cols, 0.0);
+  std::vector<HighsInt> row_inds(num_cols);
+
+  for (const auto& [col_i, val_i] : frac_vars) {
+    if (col_i < 0 || col_i >= num_cols) continue;
+
+    const double eps = val_i - std::floor(val_i);  // frac(x̄_i)
+    if (eps < 1e-7 || eps > 1.0 - 1e-7) continue;
+
+    auto it = col_to_brow.find(col_i);
+    if (it == col_to_brow.end()) continue;
+    const HighsInt brow = it->second;
+
+    // Tableau row: B^{-1}A for LP constraint row brow.
+    HighsInt row_nz = 0;
+    std::fill(row_vec.begin(), row_vec.end(), 0.0);
+    if (lpsolver.getReducedRow(brow, row_vec.data(), &row_nz,
+                               row_inds.data()) != HighsStatus::kOk)
+      continue;
+    if (row_nz == 0) continue;
+
+    std::vector<HighsInt> pi_inds;
+    std::vector<double> pi_vals;
+    double sum_inv_alpha_sq = 0.0;
+
+    for (HighsInt k = 0; k < row_nz; ++k) {
+      const HighsInt j = row_inds[k];
+      if (j < 0 || j >= num_cols) continue;
+      if (j == col_i) continue;  // basic variable handled below
+
+      const HighsBasisStatus st = basis.col_status[j];
+      if (st == HighsBasisStatus::kBasic) continue;
+
+      double a_ij = row_vec[j];
+      // Variables at upper bound: substitute x_j' = ub - x_j (negate entry).
+      const bool at_upper = (st == HighsBasisStatus::kUpper);
+      if (at_upper) a_ij = -a_ij;
+
+      if (std::abs(a_ij) < 1e-10) continue;
+      const double frac_a = a_ij - std::floor(a_ij);
+      if (frac_a < 1e-8) continue;  // integer entry → no contribution
+
+      // MIG coefficient and step to disjunction boundary (eq. 2.3 + 2.6).
+      double pi_j_eff, alpha_j;
+      if (frac_a <= eps + 1e-10) {
+        pi_j_eff = std::floor(a_ij);
+        if (frac_a < 1e-8) continue;
+        alpha_j = eps / frac_a;
+      } else {
+        pi_j_eff = std::ceil(a_ij);
+        const double omf = 1.0 - frac_a;
+        if (omf < 1e-8) continue;
+        alpha_j = (1.0 - eps) / omf;
+      }
+      if (alpha_j < 1e-10) continue;
+      sum_inv_alpha_sq += 1.0 / (alpha_j * alpha_j);
+
+      // Convert from shifted variable back to original coefficient.
+      const double pi_j = at_upper ? -pi_j_eff : pi_j_eff;
+      if (std::abs(pi_j) < 1e-10) continue;
+      pi_inds.push_back(j);
+      pi_vals.push_back(pi_j);
+    }
+
+    if (pi_inds.empty() || sum_inv_alpha_sq < 1e-20) continue;
+
+    // π_i = 1 for the basic variable itself (eq. 2.6).
+    pi_inds.push_back(col_i);
+    pi_vals.push_back(1.0);
+
+    // Intersection cut depth d = 1/sqrt(Σ 1/α_j²)  (eq. 2.5).
+    const double depth = 1.0 / std::sqrt(sum_inv_alpha_sq);
+    if (depth < 1e-10) continue;
+
+    HighsUserSeparator::HyperplaneCandidate cand;
+    cand.indices.assign(pi_inds.begin(), pi_inds.end());
+    cand.values.assign(pi_vals.begin(), pi_vals.end());
+    cand.name = "mig_" + std::to_string(col_i);
+    entries.push_back({std::move(cand), depth});
+  }
+
+  if (entries.empty()) return {};
+
+  std::sort(entries.begin(), entries.end(),
+            [](const MIGEntry& a, const MIGEntry& b) {
+              return a.depth > b.depth;
+            });
+
+  const int take = std::min(max_k, static_cast<int>(entries.size()));
+  std::vector<HighsUserSeparator::HyperplaneCandidate> result;
+  result.reserve(take);
+  for (int i = 0; i < take; ++i)
+    result.push_back(std::move(entries[i].cand));
+  return result;
+}
+
 void configure_hyperplane_branching(const Problem& problem, HiGHSBridge& bridge,
                                     Logger& logger, std::string& branch_hyper,
                                     int32_t hyper_sb_max_depth,
                                     int32_t hyper_sb_iter_limit,
                                     int32_t hyper_sb_min_reliable,
-                                    int32_t hyper_sb_max_candidates) {
+                                    int32_t hyper_sb_max_candidates,
+                                    int32_t hyper_mig_k) {
   // Hyperplane branching: dynamic constraint branching
   static constexpr std::string_view valid_modes[] = {
-      "off", "pairs", "clusters", "demand", "cardinality", "all"};
+      "off", "pairs", "clusters", "demand", "cardinality", "mig", "all"};
   if (std::find(std::begin(valid_modes), std::end(valid_modes), branch_hyper) ==
       std::end(valid_modes)) {
     logger.log("Warning: unknown branch_hyper mode '{}', using 'off'",
@@ -184,7 +324,8 @@ void configure_hyperplane_branching(const Problem& problem, HiGHSBridge& bridge,
 
   HighsUserSeparator::setBranchingCallback(
       [y_off, n, source = problem.source(), demands = std::move(demands),
-       branch_hyper, rf_pairs = std::move(rf_pairs),
+       branch_hyper, hyper_mig_k,
+       rf_pairs = std::move(rf_pairs),
        clusters = std::move(clusters)](const HighsMipSolver& mipsolver)
           -> std::vector<HighsUserSeparator::HyperplaneCandidate> {
         const auto& sol = mipsolver.mipdata_->lp.getSolution().col_value;
@@ -244,6 +385,12 @@ void configure_hyperplane_branching(const Problem& problem, HiGHSBridge& bridge,
             c.values.push_back(1.0);
           }
           result.push_back(std::move(c));
+        }
+        if (branch_hyper == "mig" || branch_hyper == "all") {
+          auto mig = generate_mig_disjunctions(mipsolver, hyper_mig_k);
+          result.insert(result.end(),
+                        std::make_move_iterator(mig.begin()),
+                        std::make_move_iterator(mig.end()));
         }
         return result;
       });
@@ -353,6 +500,8 @@ SolveResult Model::solve(const SolverOptions& options) {
   int32_t separation_interval = 1;
   double separation_tol = sep::kDefaultFracTol;
   int32_t max_cuts_per_round = 10;
+  // Karamanov §3 DA-dyn(k) cut selection (1.0 = keep all = Add-all default).
+  double cut_selector_fraction = 1.0;
 
   // --- Heuristics: warm-start ---
   bool heu_ws = true;
@@ -405,6 +554,7 @@ SolveResult Model::solve(const SolverOptions& options) {
   int32_t hyper_sb_iter_limit = 100;
   int32_t hyper_sb_min_reliable = 4;
   int32_t hyper_sb_max_candidates = 3;
+  int32_t hyper_mig_k = 10;  // top-k MIG disjunctions (Karamanov k=10)
 
   double user_time_limit = -1.0;  // -1 = no limit specified
 
@@ -457,6 +607,10 @@ SolveResult Model::solve(const SolverOptions& options) {
     }
     if (key == "max_cuts_per_round") {
       max_cuts_per_round = std::stoi(value);
+      continue;
+    }
+    if (key == "cut_selector_fraction") {
+      cut_selector_fraction = std::stod(value);
       continue;
     }
     // --- Heuristics: warm-start ---
@@ -625,6 +779,10 @@ SolveResult Model::solve(const SolverOptions& options) {
     }
     if (key == "branch_hyper_sb_max_candidates") {
       hyper_sb_max_candidates = std::stoi(value);
+      continue;
+    }
+    if (key == "branch_hyper_mig_k") {
+      hyper_mig_k = std::stoi(value);
       continue;
     }
     if (key == "output_flag") {
@@ -1180,6 +1338,7 @@ SolveResult Model::solve(const SolverOptions& options) {
   HiGHSBridge bridge(problem_, highs, logger_, separation_tol);
   bridge.set_separation_interval(separation_interval);
   bridge.set_max_cuts_per_round(max_cuts_per_round);
+  bridge.set_cut_selector_fraction(cut_selector_fraction);
   bridge.set_submip_separation(heu_highs_submip_sec);
   bridge.set_upper_bound(warm_start_ub);
   bridge.set_rc_fixing(rc_settings);
@@ -1222,7 +1381,8 @@ SolveResult Model::solve(const SolverOptions& options) {
 
   configure_hyperplane_branching(
       problem_, bridge, logger_, branch_hyper, hyper_sb_max_depth,
-      hyper_sb_iter_limit, hyper_sb_min_reliable, hyper_sb_max_candidates);
+      hyper_sb_iter_limit, hyper_sb_min_reliable, hyper_sb_max_candidates,
+      hyper_mig_k);
 
   bridge.install_separators();
   bridge.set_bounds_propagation(bounds_propagation);

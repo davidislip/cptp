@@ -8,6 +8,7 @@
 #include "core/problem.h"
 #include "parallel/parallel.h"
 #include "sep/comb_separator.h"
+#include "sep/cut_selector.h"
 #include "sep/multistar_separator.h"
 #include "sep/rci_separator.h"
 #include "sep/sec_separator.h"
@@ -89,6 +90,12 @@ std::vector<Cut> SeparationOracle::separate(std::span<const double> x_values,
   std::sort(all_cuts.begin(), all_cuts.end(), [](const Cut& a, const Cut& b) {
     return a.violation > b.violation;
   });
+
+  // Karamanov §3: optional angle-based filtering to avoid flattening.
+  if (cut_selector_fraction_ < 1.0 - 1e-12 && all_cuts.size() > 1) {
+    all_cuts = CutSelector::select_da_dyn(std::move(all_cuts),
+                                          cut_selector_fraction_);
+  }
 
   return all_cuts;
 }

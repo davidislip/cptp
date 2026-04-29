@@ -25,6 +25,7 @@ add_library(cptp
     src/sep/rglm_separator.cpp
     src/sep/spi_separator.cpp
     src/sep/separation_oracle.cpp
+    src/sep/cut_selector.cpp
     src/preprocess/bound_propagator.cpp
     src/heuristic/primal_heuristic.cpp
     src/model/model.cpp
@@ -72,6 +73,7 @@ if(CPTP_BUILD_TESTS)
         tests/test_spi.cpp
         tests/test_thread_local.cpp
         tests/test_ubs_cutoff.cpp
+        tests/test_mig_branching.cpp
     )
     target_include_directories(cptp_tests PRIVATE ${highs_SOURCE_DIR}/highs)
     target_link_libraries(cptp_tests PRIVATE cptp Catch2::Catch2WithMain)

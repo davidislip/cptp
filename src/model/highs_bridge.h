@@ -99,6 +99,11 @@ class HiGHSBridge {
   void set_max_cuts_per_round(int32_t max_cuts) {
     max_cuts_per_round_ = max_cuts;
   }
+  /// Karamanov §3 DA-dyn(k): fraction of cuts to keep after pooling.
+  /// 1.0 = Add-all (default). Smaller values filter by depth + pairwise angle.
+  void set_cut_selector_fraction(double fraction) {
+    cut_selector_fraction_ = fraction;
+  }
   void set_separator_max_cuts(const std::string& name, int32_t max_cuts) {
     per_separator_max_cuts_[name] = max_cuts;
   }
@@ -194,6 +199,9 @@ class HiGHSBridge {
   int32_t max_cuts_per_sep_ =
       3;  // max cuts per separator per round (0 = unlimited)
   int32_t max_cuts_per_round_ = 0;  // global cut cap per round (0 = unlimited)
+  // Karamanov §3 angle-based filtering: 1.0 = keep all (Add-all),
+  // smaller = filter by depth + pairwise angle (DA-dyn(k)).
+  double cut_selector_fraction_ = 1.0;
   std::unordered_map<std::string, int32_t> per_separator_max_cuts_;
   bool submip_separation_ = true;  // SEC separation at sub-MIP root node
   double upper_bound_ = std::numeric_limits<double>::infinity();
